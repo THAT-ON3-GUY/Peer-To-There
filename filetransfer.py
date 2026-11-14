@@ -4,6 +4,11 @@ filetransfer.py - send a file from one computer to another on your local network
 
 Uses only Python's standard library (socket, hashlib, json, struct), so nothing extra to install.
 
+TWO-WAY MODE (easiest): run this on BOTH computers, then send from either side:
+    python filetransfer.py start 192.168.1.42        # the OTHER computer's IP
+    > send photo.jpg
+
+ONE-WAY MODE:
 On the RECEIVING computer (start this first):
     python filetransfer.py receive
     python filetransfer.py receive --port 5001 --dest ./received
@@ -30,6 +35,7 @@ import shutil
 import socket
 import struct
 import sys
+import threading
 import time
 
 DEFAULT_PORT = 5001
@@ -39,6 +45,10 @@ TIMEOUT_SECONDS = 30            # give up if the connection stalls this long
 
 
 # ---------------------------------------------------------------- helpers
+
+class TransferError(Exception):
+    """A send/ping failed. Carries a friendly message for the user."""
+
 
 def recv_exact(sock, n):
     """Read exactly n bytes from the socket (recv() can return fewer than asked)."""
@@ -207,31 +217,51 @@ def handle_connection(conn, dest):
     print(f"  Saved and verified: {final_path}")
 
 
-def run_receiver(port, dest, once):
-    os.makedirs(dest, exist_ok=True)
-    dest = os.path.abspath(dest)
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def open_server(port):
+    """Create the listening socket, or explain why we couldn't."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
         server.bind(("0.0.0.0", port))      # listen on all network interfaces
-        server.listen(1)
+    except OSError as e:
+        server.close()
+        raise TransferError(
+            f"Could not listen on port {port} ({e}).\n"
+            "  Is another copy of this program already running? Try a different --port."
+        )
+    server.listen(1)
+    return server
+
+
+def serve(server, dest, once=False):
+    """Accept connections forever, handling one at a time."""
+    while True:
+        conn, addr = server.accept()
+        with conn:
+            conn.settimeout(TIMEOUT_SECONDS)
+            print(f"\nConnection from {addr[0]}")
+            try:
+                handle_connection(conn, dest)
+            except socket.timeout:
+                print("  ERROR: connection stalled (timed out). Partial file deleted.")
+            except (ConnectionError, ValueError, OSError) as e:
+                print(f"  ERROR: {e}")
+        if once:
+            break
+
+
+def prepare_dest(dest):
+    os.makedirs(dest, exist_ok=True)
+    return os.path.abspath(dest)
+
+
+def run_receiver(port, dest, once):
+    dest = prepare_dest(dest)
+    with open_server(port) as server:
         print(f"Receiver listening on {local_ip()}:{port}")
         print(f"Saving files to: {dest}")
         print("Press Ctrl+C to stop.\n")
-
-        while True:
-            conn, addr = server.accept()
-            with conn:
-                conn.settimeout(TIMEOUT_SECONDS)
-                print(f"Connection from {addr[0]}")
-                try:
-                    handle_connection(conn, dest)
-                except socket.timeout:
-                    print("  ERROR: connection stalled (timed out). Partial file deleted.")
-                except (ConnectionError, ValueError, OSError) as e:
-                    print(f"  ERROR: {e}")
-            if once:
-                break
+        serve(server, dest, once)
 
 
 # ---------------------------------------------------------------- sender
@@ -240,18 +270,18 @@ def connect(host, port):
     try:
         sock = socket.create_connection((host, port), timeout=TIMEOUT_SECONDS)
     except ConnectionRefusedError:
-        sys.exit(
+        raise TransferError(
             f"Could not connect to {host}:{port} - connection refused.\n"
             "  Is the receiver running on that computer, on that port?"
         )
     except socket.timeout:
-        sys.exit(
+        raise TransferError(
             f"Could not connect to {host}:{port} - timed out.\n"
             "  Check the IP address, that both devices are on the same network,\n"
             "  and that the receiver's firewall allows incoming connections on this port."
         )
     except OSError as e:
-        sys.exit(f"Could not connect to {host}:{port} - {e}")
+        raise TransferError(f"Could not connect to {host}:{port} - {e}")
     sock.settimeout(TIMEOUT_SECONDS)
     return sock
 
@@ -259,15 +289,18 @@ def connect(host, port):
 def run_ping(host, port):
     start = time.monotonic()
     with connect(host, port) as sock:
-        send_msg(sock, {"type": "ping"})
-        reply = recv_msg(sock)
+        try:
+            send_msg(sock, {"type": "ping"})
+            reply = recv_msg(sock)
+        except (ConnectionError, OSError, ValueError) as e:
+            raise TransferError(f"Ping failed: {e}")
     ms = (time.monotonic() - start) * 1000
     print(f"Connected to '{reply.get('host', host)}' at {host}:{port} ({ms:.0f} ms). Ready to send files.")
 
 
 def run_sender(path, host, port):
     if not os.path.isfile(path):
-        sys.exit(f"File not found: {path}")
+        raise TransferError(f"File not found: {path}")
 
     size = os.path.getsize(path)
     name = os.path.basename(path)
@@ -279,7 +312,7 @@ def run_sender(path, host, port):
             send_msg(sock, {"type": "file", "name": name, "size": size, "sha256": digest})
             reply = recv_msg(sock)
             if reply.get("status") != "ready":
-                sys.exit(f"Receiver refused the file: {reply.get('error', reply)}")
+                raise TransferError(f"Receiver refused the file: {reply.get('error', reply)}")
 
             progress = Progress(size, "Sending")
             sent = 0
@@ -295,14 +328,83 @@ def run_sender(path, host, port):
 
             result = recv_msg(sock)
         except socket.timeout:
-            sys.exit("\nTransfer failed: the connection stalled (timed out).")
+            raise TransferError("\nTransfer failed: the connection stalled (timed out).")
         except (ConnectionError, OSError) as e:
-            sys.exit(f"\nTransfer failed: {e}")
+            raise TransferError(f"\nTransfer failed: {e}")
 
     if result.get("status") == "ok":
         print(f"Done. Receiver verified the checksum and saved it as '{result['saved_as']}'.")
     else:
-        sys.exit(f"Transfer failed: {result.get('error', result)}")
+        raise TransferError(f"Transfer failed: {result.get('error', result)}")
+
+
+# ---------------------------------------------------------------- two-way mode
+
+HELP_TEXT = """Commands:
+  peer <ip>        set the other computer's IP address (e.g. peer 192.168.1.42)
+  ping             test the connection to the peer
+  send <file>      send a file to the peer (you can drag a file into this window)
+  help             show this list
+  quit             exit"""
+
+
+def strip_quotes(text):
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    return text
+
+
+def run_interactive(port, dest, peer):
+    """Listen for incoming files in the background while you type send commands."""
+    dest = prepare_dest(dest)
+    server = open_server(port)
+    threading.Thread(target=serve, args=(server, dest), daemon=True).start()
+
+    print(f"Two-way mode. This computer is {local_ip()} (port {port}).")
+    print(f"Incoming files are saved to: {dest}")
+    print("Run the same command on the other computer, then send from either side.\n")
+    print(HELP_TEXT)
+    if peer:
+        print(f"\nPeer set to {peer}.")
+
+    while True:
+        try:
+            line = input("\n> ").strip()
+        except EOFError:
+            break
+        if not line:
+            continue
+        command, _, rest = line.partition(" ")
+        command = command.lower()
+        rest = strip_quotes(rest)
+
+        try:
+            if command in ("quit", "exit"):
+                break
+            elif command == "help":
+                print(HELP_TEXT)
+            elif command == "peer":
+                if not rest:
+                    print(f"Peer is {peer or 'not set'}. Usage: peer <ip>")
+                else:
+                    peer = rest
+                    print(f"Peer set to {peer}.")
+            elif command in ("ping", "send"):
+                if not peer:
+                    print("Set the other computer's address first: peer <ip>")
+                elif command == "ping":
+                    run_ping(peer, port)
+                elif not rest:
+                    print("Usage: send <file>")
+                else:
+                    run_sender(rest, peer, port)
+            else:
+                print(f"Unknown command '{command}'. Type 'help' for the list.")
+        except TransferError as e:
+            print(str(e).strip())
+
+    server.close()
 
 
 # ---------------------------------------------------------------- command line
@@ -310,6 +412,11 @@ def run_sender(path, host, port):
 def main():
     parser = argparse.ArgumentParser(description="Send files between computers on your LAN over TCP.")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    t = sub.add_parser("start", help="two-way mode: receive in the background and send from a prompt")
+    t.add_argument("peer", nargs="?", help="the other computer's IP address (can also be set later)")
+    t.add_argument("--port", type=int, default=DEFAULT_PORT)
+    t.add_argument("--dest", default="received", help="folder to save files in (default: ./received)")
 
     r = sub.add_parser("receive", help="wait for incoming files")
     r.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -327,12 +434,16 @@ def main():
 
     args = parser.parse_args()
     try:
-        if args.command == "receive":
+        if args.command == "start":
+            run_interactive(args.port, args.dest, args.peer)
+        elif args.command == "receive":
             run_receiver(args.port, args.dest, args.once)
         elif args.command == "ping":
             run_ping(args.host, args.port)
         else:
             run_sender(args.file, args.host, args.port)
+    except TransferError as e:
+        sys.exit(str(e).strip())
     except KeyboardInterrupt:
         print("\nStopped.")
 
