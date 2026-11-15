@@ -105,7 +105,7 @@ New-NetFirewallRule -DisplayName "filetransfer UDP" -Direction Inbound -Protocol
 
 Working on Peer-To-There really helped me to understand how FTP works between local machines, it helped me to understand how much I really can do even with the devices and hardware I already have.
 
-[Software Demo Video](http://youtube.link.goes.here)
+[Software Demo Video](https://youtu.be/YSmKQlRoEDY)
 
 # Network Communication
 
