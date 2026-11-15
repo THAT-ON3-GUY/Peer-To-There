@@ -196,7 +196,7 @@ def main():
     try:
         password = args.password
         if password is None or password is ASK:
-            password = getpass.getpass("Password (press Enter for none): ")
+            password = getpass.getpass("Password (Password will not display as you type for security, just hit Enter for None): ")
         if password == "":
             password = None
 
