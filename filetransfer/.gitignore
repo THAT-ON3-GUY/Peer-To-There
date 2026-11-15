@@ -1,2 +1,4 @@
 /cse310_module_4_plan_online.docx
 received/*
+__pycache__/
+*.pyc
