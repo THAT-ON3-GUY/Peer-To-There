@@ -1,21 +1,42 @@
 """
-transfer.py - both sides of a file transfer: the SENDER and the RECEIVER.
+transfer.py - everything that happens over a TCP connection between two copies of the program.
 
-They're in one file because they are two halves of the same conversation.
-Read them side by side to follow a transfer step by step:
+The CLIENT (the computer making a request) and the SERVER (the computer answering it) are in
+one file because they are two halves of the same conversation. In two-way mode, every
+computer is both: its background server answers requests while you make your own.
 
-    SENDER (connect / run_sender)              RECEIVER (handle_connection)
-    -----------------------------              ----------------------------
-    opens TCP connection           ------->    accepts it
-                                   <-------    1. hello: {nonce, auth needed?}
-    2. header: {name, size,        ------->    checks password proof,
-       sha256, proof}                          file name, disk space
-                                   <-------    3. {"status": "ready"}  (or an error)
-    4. raw file bytes ...          ------->    writes to name.part, hashing as it goes
-                                   <-------    5. {"status": "ok"}  (or "error" if the
-                                                  checksum didn't match)
+Every conversation starts the same way:
 
-A "ping" is the same, except step 2 has type "ping" and the receiver answers "pong".
+    CLIENT                                    SERVER
+    opens TCP connection          ------->    accepts it
+                                  <-------    hello: {nonce, password needed?}
+    request: {type, proof, ...}   ------->    checks the password proof, then
+                                              handles the request based on its "type"
+
+The server supports FOUR kinds of request:
+
+  ping  "Are you there?"
+        client -> {"type": "ping"}
+        server -> {"status": "pong"}
+
+  list  "What files do you have?"
+        client -> {"type": "list"}
+        server -> {"status": "ok", "files": [{"name": ..., "size": ...}, ...]}
+
+  file  "Here's a file for you."  (upload / push)
+        client -> {"type": "file", "name", "size", "sha256"}
+        server -> {"status": "ready"}
+        client -> <raw file bytes>
+        server -> {"status": "ok"}  or an error if the checksum didn't match
+
+  get   "Send me one of your files."  (download / pull)
+        client -> {"type": "get", "name"}
+        server -> {"status": "sending", "name", "size", "sha256"}
+        server -> <raw file bytes>
+        client -> {"status": "ok"}  or an error if the checksum didn't match
+
+Any request can instead be answered with {"status": "error", "error": "<reason>"}.
+The files a server shares (for list and get) are the ones in its received folder.
 """
 
 import hashlib
@@ -33,10 +54,77 @@ from common import (
 )
 
 
-# -------------------- SENDING SIDE
+# -------------------- moving file bytes (used by both sides)
+
+def send_file_data(sock, path, size, label):
+    """Stream a file's raw bytes over the socket, showing a progress bar."""
+    progress = Progress(size, label)
+    sent = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            sock.sendall(chunk)
+            sent += len(chunk)
+            progress.update(sent)
+    progress.finish()
+
+
+def receive_file_data(sock, dest, name, size, expected_hash, label):
+    """
+    Read exactly `size` bytes from the socket into dest/name and verify the checksum.
+
+    Returns the saved file's path, or None if the checksum didn't match.
+    If the connection fails partway, raises the error. In every failure case the
+    partial file is deleted, so a half-finished file is never left behind.
+    """
+    final_path = unique_path(dest, name)
+    part_path = final_path + ".part"
+    hasher = hashlib.sha256()
+    received = 0
+    progress = Progress(size, label)
+    try:
+        with open(part_path, "wb") as f:
+            while received < size:
+                chunk = sock.recv(min(CHUNK_SIZE, size - received))
+                if not chunk:
+                    raise ConnectionError(
+                        f"connection lost after {human_size(received)} of {human_size(size)}"
+                    )
+                f.write(chunk)
+                hasher.update(chunk)
+                received += len(chunk)
+                progress.update(received)
+        progress.finish()
+    except BaseException:
+        sys.stdout.write("\n")
+        if os.path.exists(part_path):
+            os.remove(part_path)
+        raise
+
+    if hasher.hexdigest() != str(expected_hash).lower():
+        os.remove(part_path)
+        return None
+    os.replace(part_path, final_path)
+    return final_path
+
+
+def shareable_files(dest):
+    """The files this computer offers for 'list' and 'get': regular files in its received folder."""
+    files = []
+    for name in sorted(os.listdir(dest), key=str.lower):
+        path = os.path.join(dest, name)
+        if name.startswith(".") or name.endswith(".part") or not os.path.isfile(path):
+            continue        # skip hidden files (like .gitkeep), unfinished downloads and folders
+        files.append({"name": name, "size": os.path.getsize(path)})
+    return files
+
+
+# -------------------- CLIENT SIDE (making requests)
 
 def connect(host, port, password):
-    """Connect to a receiver and do the greeting. Returns (socket, proof)."""
+    """Connect to a server and do the greeting. Returns (socket, proof)."""
     try:
         sock = socket.create_connection((host, port), timeout=TIMEOUT_SECONDS)
     except ConnectionRefusedError:
@@ -62,7 +150,7 @@ def connect(host, port, password):
         sock.close()
         raise TransferError(
             f"{host}:{port} answered, but not like this program does.\n"
-            "  Make sure both computers have the same, latest version of filetransfer.py."
+            "  Make sure both computers have the same, latest version of the program."
         )
 
     if hello.get("auth") and not password:
@@ -72,22 +160,50 @@ def connect(host, port, password):
     return sock, proof
 
 
+def exchange(sock, message):
+    """Send one request and wait for the reply, turning network problems into TransferError."""
+    try:
+        send_msg(sock, message)
+        return recv_msg(sock)
+    except socket.timeout:
+        raise TransferError("No answer - the connection timed out.")
+    except (ConnectionError, OSError, ValueError) as e:
+        raise TransferError(f"Connection problem: {e}")
+
+
 def run_ping(host, port, password):
+    """Request type 'ping': check that the other computer is reachable and answering."""
     start = time.monotonic()
     sock, proof = connect(host, port, password)
     with sock:
-        try:
-            send_msg(sock, {"type": "ping", "proof": proof})
-            reply = recv_msg(sock)
-        except (ConnectionError, OSError, ValueError) as e:
-            raise TransferError(f"Ping failed: {e}")
+        reply = exchange(sock, {"type": "ping", "proof": proof})
     if reply.get("status") != "pong":
         raise TransferError(f"Ping failed: {reply.get('error', reply)}")
     ms = (time.monotonic() - start) * 1000
     print(f"Connected to '{reply.get('host', host)}' at {host}:{port} ({ms:.0f} ms). Ready to send files.")
 
 
+def run_list(host, port, password):
+    """Request type 'list': show the files the other computer is sharing."""
+    sock, proof = connect(host, port, password)
+    with sock:
+        reply = exchange(sock, {"type": "list", "proof": proof})
+    if reply.get("status") != "ok":
+        raise TransferError(f"List failed: {reply.get('error', reply)}")
+
+    who = reply.get("host", host)
+    files = reply.get("files", [])
+    if not files:
+        print(f"'{who}' has no files to share yet.")
+        return
+    print(f"Files on '{who}':")
+    for f in files:
+        print(f"  {f.get('name', '?')}  ({human_size(int(f.get('size', 0)))})")
+    print("Type 'get <name>' to download one.")
+
+
 def run_sender(path, host, port, password):
+    """Request type 'file': upload a file to the other computer."""
     if not os.path.isfile(path):
         raise TransferError(f"File not found: {path}")
 
@@ -98,25 +214,12 @@ def run_sender(path, host, port, password):
 
     sock, proof = connect(host, port, password)
     with sock:
+        reply = exchange(sock, {"type": "file", "name": name, "size": size,
+                                "sha256": digest, "proof": proof})
+        if reply.get("status") != "ready":
+            raise TransferError(f"Receiver refused the file: {reply.get('error', reply)}")
         try:
-            send_msg(sock, {"type": "file", "name": name, "size": size,
-                            "sha256": digest, "proof": proof})
-            reply = recv_msg(sock)
-            if reply.get("status") != "ready":
-                raise TransferError(f"Receiver refused the file: {reply.get('error', reply)}")
-
-            progress = Progress(size, "Sending")
-            sent = 0
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    sock.sendall(chunk)
-                    sent += len(chunk)
-                    progress.update(sent)
-            progress.finish()
-
+            send_file_data(sock, path, size, "Sending")
             result = recv_msg(sock)
         except socket.timeout:
             raise TransferError("\nTransfer failed: the connection stalled (timed out).")
@@ -129,33 +232,104 @@ def run_sender(path, host, port, password):
         raise TransferError(f"Transfer failed: {result.get('error', result)}")
 
 
-# -------------------- RECEIVING SIDE
+def run_get(name, host, port, password, dest):
+    """Request type 'get': download a file from the other computer into our dest folder."""
+    dest = prepare_dest(dest)
+    sock, proof = connect(host, port, password)
+    with sock:
+        reply = exchange(sock, {"type": "get", "name": name, "proof": proof})
+        if reply.get("status") != "sending":
+            raise TransferError(f"Could not get '{name}': {reply.get('error', reply)}")
+        try:
+            remote_name = safe_filename(reply["name"])
+            size = int(reply["size"])
+            expected_hash = str(reply["sha256"])
+            if size < 0:
+                raise ValueError("negative size")
+        except (KeyError, ValueError, TypeError):
+            raise TransferError("The other computer sent a malformed reply.")
+
+        free = shutil.disk_usage(dest).free
+        if size > free:
+            raise TransferError(
+                f"Not enough disk space (need {human_size(size)}, have {human_size(free)})."
+            )
+
+        print(f"Downloading {remote_name} ({human_size(size)})")
+        try:
+            saved = receive_file_data(sock, dest, remote_name, size, expected_hash, "Receiving")
+        except socket.timeout:
+            raise TransferError("\nDownload failed: the connection stalled (timed out).")
+        except (ConnectionError, OSError) as e:
+            raise TransferError(f"\nDownload failed: {e}")
+
+        # Tell the server how it went (if this fails, our copy is still fine).
+        try:
+            if saved:
+                send_msg(sock, {"status": "ok"})
+            else:
+                send_msg(sock, {"status": "error", "error": "checksum mismatch"})
+        except OSError:
+            pass
+
+    if not saved:
+        raise TransferError("Download failed: checksum mismatch - the file was corrupted in transit. "
+                            "Nothing was saved.")
+    print(f"Done. Verified and saved to: {saved}")
+
+
+# -------------------- SERVER SIDE (answering requests)
 
 def handle_connection(conn, dest, password):
+    """Greet the client, check its password proof, then hand the request to the right handler."""
     nonce = secrets.token_hex(16)
     send_msg(conn, {"type": "hello", "host": socket.gethostname(),
                     "auth": bool(password), "nonce": nonce})
-    header = recv_msg(conn)
+    request = recv_msg(conn)
 
-    if password and not same_secret(header.get("proof", ""), sign(password, nonce)):
+    if password and not same_secret(request.get("proof", ""), sign(password, nonce)):
         send_msg(conn, {"status": "error", "error": "wrong password"})
         print("  Rejected: wrong or missing password.")
         return
 
-    if header.get("type") == "ping":
-        send_msg(conn, {"status": "pong", "host": socket.gethostname()})
-        print("  Ping received - connection works.")
-        return
+    kind = request.get("type")
+    if kind == "ping":
+        handle_ping(conn)
+    elif kind == "list":
+        handle_list(conn, dest)
+    elif kind == "file":
+        handle_upload(conn, dest, request)
+    elif kind == "get":
+        handle_download(conn, dest, request)
+    else:
+        send_msg(conn, {"status": "error", "error": f"unknown request type '{kind}'"})
+        print(f"  Rejected: unknown request type '{kind}'.")
 
+
+def handle_ping(conn):
+    """Answer 'ping': just say we're here."""
+    send_msg(conn, {"status": "pong", "host": socket.gethostname()})
+    print("  Ping received - connection works.")
+
+
+def handle_list(conn, dest):
+    """Answer 'list': send the names and sizes of the files we share."""
+    files = shareable_files(dest)
+    send_msg(conn, {"status": "ok", "host": socket.gethostname(), "files": files})
+    print(f"  Sent the list of shared files ({len(files)}).")
+
+
+def handle_upload(conn, dest, request):
+    """Answer 'file': check the request, then receive, verify and save the file."""
     try:
-        name = safe_filename(header["name"])
-        size = int(header["size"])
-        expected_hash = str(header["sha256"]).lower()
+        name = safe_filename(request["name"])
+        size = int(request["size"])
+        expected_hash = str(request["sha256"])
         if size < 0:
             raise ValueError("negative file size")
     except (KeyError, ValueError, TypeError) as e:
-        send_msg(conn, {"status": "error", "error": f"bad header: {e}"})
-        print(f"  Rejected: bad header ({e})")
+        send_msg(conn, {"status": "error", "error": f"bad request: {e}"})
+        print(f"  Rejected: bad request ({e})")
         return
 
     free = shutil.disk_usage(dest).free
@@ -165,42 +339,43 @@ def handle_connection(conn, dest, password):
         print(f"  Rejected: {msg}")
         return
 
-    final_path = unique_path(dest, name)
-    part_path = final_path + ".part"
     print(f"  Incoming: {name} ({human_size(size)})")
     send_msg(conn, {"status": "ready"})
+    saved = receive_file_data(conn, dest, name, size, expected_hash, "  Receiving")
 
-    hasher = hashlib.sha256()
-    received = 0
-    progress = Progress(size, "  Receiving")
-    try:
-        with open(part_path, "wb") as f:
-            while received < size:
-                chunk = conn.recv(min(CHUNK_SIZE, size - received))
-                if not chunk:
-                    raise ConnectionError(
-                        f"sender disconnected after {human_size(received)} of {human_size(size)}"
-                    )
-                f.write(chunk)
-                hasher.update(chunk)
-                received += len(chunk)
-                progress.update(received)
-        progress.finish()
-    except BaseException:
-        sys.stdout.write("\n")
-        if os.path.exists(part_path):
-            os.remove(part_path)        # don't leave half-written files behind
-        raise
-
-    if hasher.hexdigest() != expected_hash:
-        os.remove(part_path)
+    if not saved:
         send_msg(conn, {"status": "error", "error": "checksum mismatch - file was corrupted in transit"})
         print("  FAILED: checksum mismatch, partial file deleted.")
         return
+    send_msg(conn, {"status": "ok", "saved_as": os.path.basename(saved)})
+    print(f"  Saved and verified: {saved}")
 
-    os.replace(part_path, final_path)
-    send_msg(conn, {"status": "ok", "saved_as": os.path.basename(final_path)})
-    print(f"  Saved and verified: {final_path}")
+
+def handle_download(conn, dest, request):
+    """Answer 'get': send one of our shared files to the client."""
+    try:
+        name = safe_filename(request["name"])
+    except (KeyError, ValueError):
+        send_msg(conn, {"status": "error", "error": "bad file name"})
+        return
+
+    if name not in {f["name"] for f in shareable_files(dest)}:
+        send_msg(conn, {"status": "error", "error": f"no shared file named '{name}'"})
+        print(f"  Request for '{name}' - no such file.")
+        return
+
+    path = os.path.join(dest, name)
+    size = os.path.getsize(path)
+    print(f"  Request for {name} ({human_size(size)})")
+    send_msg(conn, {"status": "sending", "name": name, "size": size,
+                    "sha256": sha256_of_file(path)})
+    send_file_data(conn, path, size, "  Sending")
+
+    result = recv_msg(conn)
+    if result.get("status") == "ok":
+        print("  Sent - the other computer verified the checksum.")
+    else:
+        print(f"  The other computer reported a problem: {result.get('error', result)}")
 
 
 def open_server(port):
@@ -232,7 +407,7 @@ def serve(server, dest, password, once=False):
             try:
                 handle_connection(conn, dest, password)
             except socket.timeout:
-                print("  ERROR: connection stalled (timed out). Partial file deleted.")
+                print("  ERROR: connection stalled (timed out).")
             except (ConnectionError, ValueError, OSError) as e:
                 print(f"  ERROR: {e}")
         if once:
@@ -240,11 +415,13 @@ def serve(server, dest, password, once=False):
 
 
 def prepare_dest(dest):
+    """Create the folder if needed and return its full path."""
     os.makedirs(dest, exist_ok=True)
     return os.path.abspath(dest)
 
 
 def run_receiver(port, dest, password, once):
+    """One-way mode: answer requests until stopped."""
     dest = prepare_dest(dest)
     with open_server(port) as server:
         print(f"Receiver listening on {local_ip()}:{port}")

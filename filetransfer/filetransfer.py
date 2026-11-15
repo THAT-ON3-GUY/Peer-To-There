@@ -2,17 +2,22 @@
 """
 filetransfer.py - the program you run. Handles everything you type.
 
-TWO-WAY MODE (easiest): run this on BOTH computers.
-    python filetransfer.py start --password
+TWO-WAY MODE (easiest): run this on BOTH computers (or just press Run in VS Code).
+    python filetransfer.py
 They find each other automatically. Then, at the > prompt on either computer:
-    > send photo.jpg
+    > send photo.jpg       upload a file to the other computer
+    > list                 see the files the other computer is sharing
+    > get photo.jpg        download one of them
 
 ONE-WAY MODE:
-    python filetransfer.py receive --password              (on the receiving computer)
-    python filetransfer.py ping 192.168.1.42 --password    (on the sending computer)
-    python filetransfer.py send photo.jpg 192.168.1.42 --password
+    python filetransfer.py receive                       (on the computer answering requests)
+    python filetransfer.py ping 192.168.1.42             (on the other computer)
+    python filetransfer.py send photo.jpg 192.168.1.42
+    python filetransfer.py list 192.168.1.42
+    python filetransfer.py get photo.jpg 192.168.1.42
 
---password with no value asks you to type it (hidden). Use the same password on both computers.
+The program asks for a password when it starts (press Enter for none).
+Use the same password on both computers. You can also give it as --password <value>.
 
 Files in this program:
     filetransfer.py  - this file: command line and the two-way > prompt
@@ -32,7 +37,9 @@ import threading
 
 from common import DEFAULT_PORT, TransferError, local_ip
 from discovery import Discovery
-from transfer import open_server, prepare_dest, run_ping, run_receiver, run_sender, serve
+from transfer import (
+    open_server, prepare_dest, run_get, run_list, run_ping, run_receiver, run_sender, serve,
+)
 
 ASK = object()      # marker meaning "--password was given without a value"
 
@@ -41,9 +48,11 @@ ASK = object()      # marker meaning "--password was given without a value"
 
 HELP_TEXT = """Commands:
   peers            list computers found on the network
-  peer <n | ip>    choose who to send to: a number from 'peers', or an IP address
+  peer <n | ip>    choose the other computer: a number from 'peers', or an IP address
   ping             test the connection to the chosen computer
-  send <file>      send a file (tip: type 'send ' then drag a file into this window)
+  send <file>      upload a file (tip: type 'send ' then drag a file into this window)
+  list             see the files the chosen computer is sharing
+  get <name>       download one of those files
   help             show this list
   quit             exit"""
 
@@ -137,15 +146,19 @@ def run_interactive(port, dest, password, peer_ip, discover):
                     with state_lock:
                         state["peer"] = (rest, DEFAULT_PORT, rest)
                     print(f"Selected {rest}.")
-            elif command in ("ping", "send"):
+            elif command in ("ping", "send", "list", "get"):
                 if not peer:
                     print("No computer selected yet. Type 'peers', or 'peer <ip>'.")
                 elif command == "ping":
                     run_ping(peer[0], peer[1], password)
+                elif command == "list":
+                    run_list(peer[0], peer[1], password)
                 elif not rest:
-                    print("Usage: send <file>")
-                else:
+                    print(f"Usage: {command} <{'file' if command == 'send' else 'name'}>")
+                elif command == "send":
                     run_sender(rest, peer[0], peer[1], password)
+                else:
+                    run_get(rest, peer[0], peer[1], password, dest)
             else:
                 print(f"Unknown command '{command}'. Type 'help' for the list.")
         except TransferError as e:
@@ -190,13 +203,26 @@ def main():
     s.add_argument("--port", type=int, default=DEFAULT_PORT)
     add_password(s)
 
+    l = sub.add_parser("list", help="see the files another computer is sharing")
+    l.add_argument("host", help="the other computer's IP address, e.g. 192.168.1.42")
+    l.add_argument("--port", type=int, default=DEFAULT_PORT)
+    add_password(l)
+
+    g = sub.add_parser("get", help="download a file from another computer")
+    g.add_argument("name", help="the file's name, as shown by 'list'")
+    g.add_argument("host", help="the other computer's IP address, e.g. 192.168.1.42")
+    g.add_argument("--port", type=int, default=DEFAULT_PORT)
+    g.add_argument("--dest", default="received", help="folder to save it in (default: ./received)")
+    add_password(g)
+
     args = parser.parse_args()
-    if args.command is None:
-        args = parser. parse_args(["start"])
+    if args.command is None:            # no command given (e.g. VS Code's Run button)
+        args = parser.parse_args(["start"])
+
     try:
         password = args.password
         if password is None or password is ASK:
-            password = getpass.getpass("Password (Password will not display as you type for security, just hit Enter for None): ")
+            password = getpass.getpass("Password (press Enter for none): ")
         if password == "":
             password = None
 
@@ -206,6 +232,10 @@ def main():
             run_receiver(args.port, args.dest, password, args.once)
         elif args.command == "ping":
             run_ping(args.host, args.port, password)
+        elif args.command == "list":
+            run_list(args.host, args.port, password)
+        elif args.command == "get":
+            run_get(args.name, args.host, args.port, password, args.dest)
         else:
             run_sender(args.file, args.host, args.port, password)
     except TransferError as e:

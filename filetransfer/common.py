@@ -25,12 +25,12 @@ import time
 
 DEFAULT_PORT = 5001             # TCP port used for file transfers (change with --port)
 DISCOVERY_PORT = 5002           # UDP port used to find other computers
-CHUNK_SIZE = 64 * 1024          # how many bytes are read/sent at a time (64 KB)
-MAX_HEADER_BYTES = 64 * 1024    # largest acceptable JSON message
+CHUNK_SIZE = 64 * 1024          # how many bytes we read/send at a time (64 KB)
+MAX_HEADER_BYTES = 1024 * 1024  # largest JSON message we'll accept (1 MB)
 TIMEOUT_SECONDS = 30            # give up if a connection is silent this long
 BEACON_INTERVAL = 3             # seconds between discovery "hello" broadcasts
-PEER_EXPIRY = 12                # forget a computer that hasn't been heard from in this long
-APP_ID = "filetransfer-v3"      # copies with a different ID ignore each other
+PEER_EXPIRY = 12                # forget a computer we haven't heard from in this long
+APP_ID = "filetransfer-v4"      # copies with a different ID ignore each other
 
 
 # -------------------- errors
