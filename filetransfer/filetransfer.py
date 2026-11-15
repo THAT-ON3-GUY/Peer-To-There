@@ -160,7 +160,7 @@ def run_interactive(port, dest, password, peer_ip, discover):
 
 def main():
     parser = argparse.ArgumentParser(description="Send files between computers on your LAN over TCP.")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     def add_password(p):
         p.add_argument("--password", nargs="?", const=ASK, default=None,
@@ -191,10 +191,12 @@ def main():
     add_password(s)
 
     args = parser.parse_args()
+    if args.command is None:
+        args = parser. parse_args(["start"])
     try:
         password = args.password
-        if password is ASK:
-            password = getpass.getpass("Password: ")
+        if password is None or password is ASK:
+            password = getpass.getpass("Password (press Enter for none): ")
         if password == "":
             password = None
 
