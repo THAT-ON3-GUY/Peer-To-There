@@ -1,6 +1,6 @@
 # Overview
 
-Peer-To-There is a command-line program for sending files directly between two computers on the same local network, with no cloud service, USB drive or email attachment in between. As a software engineer, I wanted to understand what actually happens when two programs talk over a network: how a connection is opened, how a stream of bytes is split into meaningful messages, how one computer can find another without being told its address, and how to make sure a file arrives exactly as it was sent.
+Peer-To-There is a command-line program for sending files directly between two computers on the same local network, with no cloud service, USB drive or email attachment in between. As a software engineer, I wanted to understand what actually happens when two programs talk over a network: how a connection is opened, how a stream of bytes is split into meaningful messages, and how to make sure a file arrives exactly as it was sent.
 
 Every copy of the program is a **peer**: it listens for requests from other computers while also letting you make requests of your own. When two copies are running on the same network, they find each other automatically, and then either side can:
 
@@ -64,7 +64,7 @@ Useful options: `--password <value>` (skip the password prompt), `--port <n>` (d
    - **Windows:** on the first installer screen, check **"Add python.exe to PATH."**
    - **macOS:** use `python3` wherever these instructions say `python`.
 2. Confirm it works: `python --version`
-3. Get the code onto both computers (`git clone https://github.com/THAT-ON3-GUY/Peer-To-There.git`, or copy the `filetransfer` folder). All four `.py` files must stay together in the same folder.
+3. Get the code onto both computers (`git clone https://github.com/THAT-ON3-GUY/Peer-To-There.git`, or copy the `filetransfer` folder). All four `.py` files must stay together in the same folder. Make sure that if you're opening it in VS Code that you're within the filetransfer folder so VS Code knows where to run commands, find files, etc.
 
 No extra packages are needed. The program uses only Python's standard library.
 
@@ -103,7 +103,7 @@ New-NetFirewallRule -DisplayName "filetransfer UDP" -Direction Inbound -Protocol
 | Discovery works but nothing else does | Some shared networks block direct device-to-device connections ("client isolation"). Use a phone hotspot or an Ethernet cable between the two computers. |
 | "requires a password" / "wrong password" | Start both computers with the same password. |
 
-{Describe your purpose for writing this software.}
+Working on Peer-To-There really helped me to understand how FTP works between local machines, it helped me to understand how much I really can do even with the devices and hardware I already have.
 
 [Software Demo Video](http://youtube.link.goes.here)
 
@@ -227,20 +227,20 @@ Python 3, using only the standard library:
 * [Python docs: getpass - Portable password input](https://docs.python.org/3/library/getpass.html)
 * [Python docs: shutil.disk_usage](https://docs.python.org/3/library/shutil.html#shutil.disk_usage)
 
-**Setup and tools**
-* [Python downloads](https://www.python.org/downloads/)
-* [VS Code: Getting started with Python](https://code.visualstudio.com/docs/python/python-tutorial)
+**Tools**
 * [Microsoft Learn: New-NetFirewallRule](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule)
 * [Microsoft Learn: Test-NetConnection](https://learn.microsoft.com/en-us/powershell/module/nettcpip/test-netconnection)
-* [Git documentation: gitignore](https://git-scm.com/docs/gitignore)
 
 # Future Work
 
-{Make a list of things that you need to fix, improve, and add in the future.}
-* Item 1
-* Item 2
-* Item 3
+* I want to implement my own GUI for the app
+* I'd like to package the app so you can install it just on your desktop
+* I'd like to learn more in depth about both TCP and UDP and other ways I can use them.
 
 # AI Usage
 
-{Describe how you used AI tools during this project: what you asked for help with, how it helped you learn or move faster, what you changed or verified yourself, and anything you would do differently next time.}
+Using UDP to automatically identify other devices wasn't part of the original scope of my program and also wasn't somthing I had dedicated time for to do on my own because of this along with matters of convenience I used AI for a number of things
+
+* AI was used to create the `discovery.py` file which uses UDP in order to detect other devices running Peer-To-There
+* AI was used in the writing of software documentation and this `README.md`
+* AI was used to enrich my learning and also help me understand concepts such as UTF-8 encoding and the use of SHA-256 in order to verify file security and integrity, TCP file transfer using Python's socket library.
